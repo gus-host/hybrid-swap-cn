@@ -1,0 +1,223 @@
+module SumSwap where
+
+-- import DA.Action (foldlA)
+-- import DA.Map (Map)
+-- import qualified DA.Map as Map
+-- import DA.Optional (fromSomeNote)
+-- import Daml.Script
+-- import Scripts.Util (createParty)
+
+-- =============================================================================
+-- MODULE 1: ASSET STANDARDS (UTXO MODEL)
+-- =============================================================================
+
+-- | A tokenized asset representing real-world value (e.g., Stablecoin, Gold).
+-- Uses the UTXO model: each contract is a unique holding.
+template Asset
+  with
+    issuer    : Party        -- Institution verifying the real-world asset
+    owner     : Party        -- Current holder (User, Liquidity Provider, or Pool)
+    symbol    : Text         -- e.g., "USD", "EUR"
+    amount    : Decimal      -- Quantity
+    observers : [Party]      -- Regulators or auditors
+  where
+    signatory issuer, owner
+    observer observers
+
+    ensure amount > 0.0
+
+    choice Split : (ContractId Asset, ContractId Asset)
+      with splitAmount : Decimal
+      controller owner
+      do
+        assertMsg "Split amount must be positive" (splitAmount > 0.0)
+        assertMsg "Insufficient funds" (splitAmount < amount)
+
+        asset1 <- create this with amount = splitAmount
+        asset2 <- create this with amount = amount - splitAmount
+        return (asset1, asset2)
+
+    choice Merge : ContractId Asset
+      with otherCid : ContractId Asset
+      controller owner
+      do
+        other <- fetch otherCid
+        assertMsg "Merge: Owner mismatch" (other.owner == owner)
+        assertMsg "Merge: Symbol mismatch" (other.symbol == symbol)
+        assertMsg "Merge: Issuer mismatch" (other.issuer == issuer)
+        archive otherCid
+        create this with amount = amount + other.amount
+
+    choice Transfer : ContractId Asset
+      with newOwner : Party
+      controller owner
+      do
+        create this with
+          owner = newOwner
+          observers = []
+
+-- =============================================================================
+-- MODULE 2: CONSTANT SUM MARKET MAKER (CSMM)
+-- =============================================================================
+
+template ConstantSumPool
+  with
+    operator      : Party
+    providers     : [Party]
+    symbolA       : Text
+    symbolB       : Text
+    reserveA_Cid  : ContractId Asset
+    reserveB_Cid  : ContractId Asset
+    feeRate       : Decimal
+  where
+    signatory operator
+    observer providers
+
+    ensure feeRate >= 0.0 && feeRate < 1.0
+
+    choice SwapA_for_B : (ContractId ConstantSumPool, ContractId Asset)
+      with
+        user     : Party
+        inputCid : ContractId Asset
+      controller operator
+      do
+        input <- fetch inputCid
+        assertMsg "Swap: Symbol mismatch" (input.symbol == symbolA)
+        assertMsg "Swap: Owner must be pool" (input.owner == operator)
+
+        let
+          dx  = input.amount
+          fee = dx * feeRate
+          dy  = dx - fee
+
+        resB <- fetch reserveB_Cid
+        assertMsg ("High Slippage / Low Liquidity: Cannot fulfill swap of " <> show dy)
+          (resB.amount >= dy)
+
+        newResA_Cid <- exercise reserveA_Cid Merge with otherCid = inputCid
+        (outputCid, remainingResB_Cid) <- exercise reserveB_Cid Split with splitAmount = dy
+        finalOutputCid <- exercise outputCid Transfer with newOwner = user
+
+        newPoolCid <- create this with
+          reserveA_Cid = newResA_Cid
+          reserveB_Cid = remainingResB_Cid
+
+        return (newPoolCid, finalOutputCid)
+
+    choice AddLiquidity : ContractId ConstantSumPool
+      with
+        provider    : Party
+        inputA_Cid  : ContractId Asset
+        inputB_Cid  : ContractId Asset
+      controller operator, provider
+      do
+        newResA <- exercise reserveA_Cid Merge with otherCid = inputA_Cid
+        newResB <- exercise reserveB_Cid Merge with otherCid = inputB_Cid
+
+        create this with
+          reserveA_Cid = newResA
+          reserveB_Cid = newResB
+          providers =
+            if provider `elem` providers then providers else provider :: providers
+
+-- =============================================================================
+-- MODULE 3: DEX ROUTER / AGGREGATOR
+-- =============================================================================
+
+template SwapRequest
+  with
+    user      : Party
+    operator  : Party
+    offerCid  : ContractId Asset
+    wantSymbol: Text
+    minOutput : Decimal
+  where
+    signatory user
+    observer operator
+
+    choice CancelRequest : ContractId Asset
+      controller user
+      do return offerCid
+
+    choice ExecuteSwap : (ContractId ConstantSumPool, ContractId Asset)
+      with poolCid : ContractId ConstantSumPool
+      controller operator
+      do
+        pool  <- fetch poolCid
+        offer <- fetch offerCid
+
+        opControlCid <- exercise offerCid Transfer with newOwner = operator
+
+        if offer.symbol == pool.symbolA && wantSymbol == pool.symbolB then
+          exercise poolCid SwapA_for_B with
+            user = user
+            inputCid = opControlCid
+        else
+          abort "Swap direction or symbols not supported in this simplistic example"
+
+-- =============================================================================
+-- MODULE 4: TESTING SCENARIOS
+-- =============================================================================
+
+-- setup : Script ()
+-- setup = do
+
+--   [alice, bank, bob, operator] <- mapA createParty ["Alice", "Bank", "Bob", "DexOp"]
+--   -- alice    <- allocatePartyWithHint "Alice" (PartyIdHint "Alice")
+--   -- bob      <- allocatePartyWithHint "Bob" (PartyIdHint "Bob")
+--   -- bank     <- allocatePartyWithHint "Bank" (PartyIdHint "Bank")
+--   -- operator <- allocatePartyWithHint "DexOp" (PartyIdHint "DexOp")
+
+--   usd_alice_cid <- submitMulti [bank, alice] do
+--     createCmd Asset with issuer = bank; owner = alice; symbol = "USD"; amount = 1000.0; observers = []
+
+--   eur_alice_cid <- submitMulti [bank, alice] do
+--     createCmd Asset with issuer = bank; owner = alice; symbol = "EUR"; amount = 1000.0; observers = []
+
+--   usd_bob_cid <- submit bank do
+--     createCmd Asset with issuer = bank; owner = bob; symbol = "USD"; amount = 100.0; observers = []
+
+--   seed_usd <- submit alice do
+--     exerciseCmd usd_alice_cid Transfer with newOwner = operator
+
+--   seed_eur <- submit alice do
+--     exerciseCmd eur_alice_cid Transfer with newOwner = operator
+
+--   pool_cid <- submit operator do
+--     createCmd ConstantSumPool with
+--       operator = operator
+--       providers = [alice]
+--       symbolA = "USD"
+--       symbolB = "EUR"
+--       reserveA_Cid = seed_usd
+--       reserveB_Cid = seed_eur
+--       feeRate = 0.01
+
+--   (pay_cid, keep_cid) <- submit bob do
+--     exerciseCmd usd_bob_cid Split with splitAmount = 50.0
+
+--   request_cid <- submit bob do
+--     createCmd SwapRequest with
+--       user = bob
+--       operator = operator
+--       offerCid = pay_cid
+--       wantSymbol = "EUR"
+--       minOutput = 49.0
+
+--   (new_pool_cid, bob_eur_cid) <- submit operator do
+--     exerciseCmd request_cid ExecuteSwap with poolCid = pool_cid
+
+--   eur_holding <- queryContractId bob bob_eur_cid
+--   let amount = (fromSomeNote "Asset not found" eur_holding).amount
+--   debug $ "Bob received EUR: " <> show amount
+
+--   big_usd_cid <- submit bank do
+--     createCmd Asset with issuer = bank; owner = bob; symbol = "USD"; amount = 2000.0; observers = []
+
+--   big_request_cid <- submit bob do
+--     createCmd SwapRequest with user = bob; operator = operator; offerCid = big_usd_cid; wantSymbol = "EUR"; minOutput = 1.0
+
+--   submitMustFail operator do
+--     exerciseCmd big_request_cid ExecuteSwap with poolCid = new_pool_cid
+
+--   pure ()

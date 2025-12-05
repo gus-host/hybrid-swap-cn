@@ -1,0 +1,315 @@
+module Main where
+
+import Daml.Script
+import DA.Math
+import DA.List
+import DA.Set as Set
+import DA.Foldable
+-- import DA.Optional (fromSomeNote)
+
+-- compute the hybrid invariant k = m*(x+y) + (1-m)*(x*y)
+hybridInvariant : Decimal -> Decimal -> Decimal -> Decimal
+hybridInvariant m x y = m * (x + y) + (1.0 - m) * (x * y)
+
+-- Simple UTxO-style asset for demo (replace with Daml Finance holdings in prod)
+template Asset
+  with
+    issuer    : Party
+    owner     : Party
+    symbol    : Text
+    amount    : Decimal
+    observers : [Party]
+  where
+    signatory issuer, owner
+    observer observers
+    ensure amount > 0.0
+
+    choice Transfer : ContractId Asset
+      with newOwner : Party
+      controller owner
+      do
+        create this with owner = newOwner; observers = []
+
+    -- For UTxO convenience: split a holding into two (returns CIDs)
+    choice Split : (ContractId Asset, ContractId Asset)
+      with splitAmount : Decimal
+      controller owner
+      do
+        assertMsg "splitAmount > 0" (splitAmount > 0.0)
+        assertMsg "splitAmount < amount" (splitAmount < amount)
+        a1 <- create this with amount = splitAmount
+        a2 <- create this with amount = amount - splitAmount
+        return (a1, a2)
+
+    -- Merge another identical holding into a new one (archive otherCid)
+    choice Merge : ContractId Asset
+      with otherCid : ContractId Asset
+      controller owner
+      do
+        other <- fetch otherCid
+        assertMsg "issuer mismatch" (other.issuer == issuer)
+        assertMsg "symbol mismatch" (other.symbol == symbol)
+        assertMsg "owner mismatch" (other.owner == owner)
+        archive otherCid
+        create this with amount = amount + other.amount
+
+-- -----------------------------------------------------------------------------
+-- Hybrid AMM pool (simple aggregated reserves example)
+-- -----------------------------------------------------------------------------
+-- Hybrid invariant:
+--   k = m * (x + y) + (1 - m) * (x * y)
+-- where 0 <= m <= 1 is the "sum weight".
+template HybridPool
+  with
+    operator    : Party           -- pool operator / router
+    lpProviders : [Party]
+    symbolA     : Text
+    symbolB     : Text
+    reserveA    : Decimal        -- aggregated reserve amount for token A
+    reserveB    : Decimal        -- aggregated reserve amount for token B
+    weightM     : Decimal        -- m in [0,1]
+    feeRate     : Decimal        -- fee fraction (e.g. 0.003)
+    totalLPTokens: Decimal
+
+  where
+    signatory operator
+    observer lpProviders
+
+    ensure weightM >= 0.0 && weightM <= 1.0 && feeRate >= 0.0 && feeRate < 1.0 && reserveA >= 0.0 && reserveB >= 0.0
+
+    key (symbolA, symbolB, operator) : (Text, Text, Party)
+    maintainer key._3
+
+    -- Swap A -> B using closed form for y' (algebraic)
+    -- Given dx_in (gross user input), we apply fee and compute dx = dx_in * (1 - fee)
+    -- x' = x + dx
+    -- Solve for y' from: m*(x' + y') + (1-m)*(x'*y') = k
+    -- which is linear in y': y' * (m + (1-m)*x') = k - m*x'
+    choice SwapAforB : (ContractId HybridPool, Decimal) -- return new pool CID and netOut (dy after fee)
+      with
+        user           : Party
+        grossInput     : Decimal        -- gross dx provided by user (before pool receives)
+        minAcceptable   : Decimal       -- slippage protection (min dy expected)
+      controller operator
+      do
+        assertMsg "grossInput > 0" (grossInput > 0.0)
+
+        -- apply fee
+        let dx = grossInput * (1.0 - feeRate)
+            feeAmt = grossInput * feeRate  -- this is what will be distributed
+            x' = reserveA + dx
+            x  = reserveA
+            y  = reserveB
+            m  = weightM
+            k  = hybridInvariant m x y
+
+            denom = m + (1.0 - m) * x'
+        
+        assertMsg "Insufficient denominator" (denom /= 0.0)
+        let
+            y' = (k - m * x') / denom
+            grossOut = y - y'
+            netOut = grossOut -- already subtracted fee on input side; alternatively fee can be taken from output
+
+        assertMsg "Negative output" (netOut >= 0.0)
+        assertMsg "Insufficient liquidity" (y' >= 0.0)
+        assertMsg "Slippage: output < minAcceptable" (netOut >= minAcceptable)
+
+        lpTokens <- mapA(\x -> do fetchByKey @LPToken x ) lpProviders
+
+            -- Distribute feeAmt among LP providers
+        mapA_ (\(cid, lp) -> do
+      -- Calculate share
+        let
+          lpShare = lp.amount / totalLPTokens
+          lpFee = feeAmt * lpShare
+
+      -- Create record of fee received
+        create LPFeeReceipt
+         with
+          recipient = lp.owner
+          token = symbolA
+          amount = lpFee
+          pool = self
+
+        ) lpTokens
+
+        archive self
+
+        -- Update pool reserves (note: we keep aggregated reserves here)
+        newPoolCid <- create this with
+          reserveA = x'
+          reserveB = y'
+          -- keep other fields unchanged
+          
+
+        return (newPoolCid, netOut)
+
+    
+
+    -- Add Liquidity: provider supplies amounts for both tokens
+    choice AddLiquidity : ContractId HybridPool
+      with
+        provider : Party
+        addA     : Decimal
+        addB     : Decimal
+      controller operator, provider
+      do
+        -- If this is the first LP
+        let lpToMint =
+                if reserveA == 0.0 && reserveB == 0.0
+                then sqrt (addA * addB)  -- initial LP tokens
+                else
+                  let
+                    liquidityAdded = addA + addB
+                    totalLiquidity = reserveA + reserveB
+                  in
+                    (liquidityAdded / totalLiquidity) * totalLPTokens
+
+        assertMsg "LP tokens must be positive" (lpToMint > 0.0)
+
+        assertMsg "add amounts must be >= 0" (addA >= 0.0 && addB >= 0.0)
+        create LPToken
+            with
+              owner = provider
+              pool = self
+              amount = lpToMint
+        
+        archive self
+        create this with
+          reserveA = reserveA + addA
+          reserveB = reserveB + addB
+          totalLPTokens = totalLPTokens + lpToMint
+          lpProviders = if provider `DA.List.elem` lpProviders then lpProviders else provider :: lpProviders
+
+    -- Remove Liquidity: simplistic proportional withdraw (not LP token tracked)
+    choice RemoveLiquidity : (ContractId HybridPool, Decimal, Decimal)
+      with
+        provider : Party
+        pct      : Decimal   -- fraction in [0,1] to remove
+      controller operator, provider
+      do
+        (lpTokenCId, lpTokenForPovider) <- fetchByKey @LPToken provider
+        -- (hybridPoolCId, hybridPool) <- fetchByKey @HybridPool (symbolA, symbolB, operator)
+        let hybridPool = this;
+
+        archive lpTokenCId
+
+      -- Calculate ownership share
+        let
+         share = lpTokenForPovider.amount / hybridPool.totalLPTokens
+         tokenAOut = hybridPool.reserveA * share
+         tokenBOut = hybridPool.reserveB * share
+         remainingLPTokens = hybridPool.totalLPTokens - lpTokenForPovider.amount
+         remainingTokenA = hybridPool.reserveA - tokenAOut
+         remainingTokenB = hybridPool.reserveB - tokenBOut
+
+        assertMsg "Withdrawal amount invalid" (tokenAOut > 0.0 && tokenBOut > 0.0)
+
+              -- Update the pool
+
+        archive self
+        poolCidNew <- create this
+         with
+          reserveA = remainingTokenA
+          reserveB = remainingTokenB
+          totalLPTokens = remainingLPTokens
+          lpProviders = DA.List.filter (/= provider) lpProviders
+  
+        return (poolCidNew, tokenAOut, tokenBOut)
+
+
+
+
+template LPToken
+  with
+    owner: Party
+    pool: ContractId HybridPool
+    amount: Decimal   -- Amount of LP tokens (share)
+  where
+    signatory owner
+
+    key (owner): (Party)
+    maintainer key
+
+template LPFeeReceipt
+  with
+    recipient : Party
+    pool      : ContractId HybridPool
+    token     : Text
+    amount    : Decimal
+  where
+    signatory recipient
+
+-- -----------------------------------------------------------------------------
+-- Quick script to exercise the pool and show basic behavior
+-- -----------------------------------------------------------------------------
+setup : Script ()
+setup = do
+--  debug $ Set.fromList ["Alice", "bob"]
+ -- operator seed pool with some reserves (for demo we directly set reserves)
+  alice <- allocatePartyWithHint "Alice" (PartyIdHint "Alice")
+  bob <- allocatePartyWithHint "Bob" (PartyIdHint "Bob")
+  bank <- allocatePartyWithHint "Bank" (PartyIdHint "Bank")
+  op <- allocatePartyWithHint "Op" (PartyIdHint "Op")
+  poolCid <- submit op do
+    createCmd HybridPool with
+      operator = op
+      lpProviders = []
+      symbolA = "USD"
+      symbolB = "EUR"
+      reserveA = 0.0
+      reserveB = 0.0
+      weightM = 0.8    -- largely constant-sum behaviour near equilibrium
+      feeRate = 0.01   -- 1% fee
+      totalLPTokens = 0.0
+
+  return ()
+  -- alice <- allocatePartyWithHint "Alice" (PartyIdHint "Alice")
+  -- bob <- allocatePartyWithHint "Bob" (PartyIdHint "Bob")
+  -- bank <- allocatePartyWithHint "Bank" (PartyIdHint "Bank")
+  -- op <- allocatePartyWithHint "Op" (PartyIdHint "Op")
+
+  -- -- mint simple assets for demo (these holdings are illustrative)
+  -- usdAlice <- submitMulti [bank, alice] [] do
+  --   createCmd Asset with
+  --       issuer = bank
+  --       owner = alice
+  --       symbol = "USD"
+  --       amount = 1000.0
+  --       observers = []
+
+  -- usdAlice <- submitMulti [bank, bob] [] do
+  --   createCmd Asset with
+  --       issuer = bank
+  --       owner = bob
+  --       symbol = "EUR"
+  --       amount = 1000.0
+  --       observers = []
+
+  -- -- operator seed pool with some reserves (for demo we directly set reserves)
+  -- poolCid <- submit op do
+  --   createCmd HybridPool with
+  --     operator = op
+  --     lpProviders = [alice]
+  --     symbolA = "USD"
+  --     symbolB = "EUR"
+  --     reserveA = 1000.0
+  --     reserveB = 1000.0
+  --     weightM = 0.8    -- largely constant-sum behaviour near equilibrium
+  --     feeRate = 0.01   -- 1% fee
+  --     totalLPTokens = 0.0
+
+  -- -- Bob wants to swap 50 USD -> EUR
+  -- (newPoolCid, got) <- submit op do
+  --   exerciseCmd poolCid SwapAforB with user = bob; grossInput = 50.0; minAcceptable = 40.0
+
+  -- debug $ "Bob received (approx): " <> show got
+
+  -- -- Edge: big swap that should fail due to insufficient liquidity (slippage check)
+  -- -- Attempt to swap a huge amount
+  -- submitMustFail op do
+  --   exerciseCmd newPoolCid SwapAforB with user = bob; grossInput = 2000.0; minAcceptable = 1.0
+
+  -- pure ()
+
