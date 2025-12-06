@@ -3,7 +3,7 @@ module Main where
 import Daml.Script
 import DA.Math
 import DA.List
-import DA.Set as Set
+-- import DA.Set as Set
 import DA.Foldable
 -- import DA.Optional (fromSomeNote)
 
